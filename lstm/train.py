@@ -7,218 +7,204 @@ from keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from keras.optimizers import Adam
 import tensorflow as tf
 from sklearn.preprocessing import MinMaxScaler
-import os      # Keep os for path joining
-import sys     # Keep sys for exit
+import matplotlib.pyplot as plt
 
-# Define function to create a unified LSTM model
 def create_unified_lstm_model(time_step, num_devices):
+    """Create LSTM model with power and device inputs."""
     power_input = Input(shape=(time_step, 1), name='power_input')
     device_input = Input(shape=(1,), name='device_input')
-    # Consider simplifying or adjusting embedding if device IDs are just integers
-    device_embedding = Dense(8)(device_input) # Simple embedding
+    
+    device_embedding = Dense(8)(device_input)
     device_embedding = Dense(4, activation='relu')(device_embedding)
-
+    
     lstm = Bidirectional(LSTM(units=64, return_sequences=True, activation='tanh'))(power_input)
     lstm = BatchNormalization()(lstm)
     lstm = Dropout(0.3)(lstm)
-
     lstm = Bidirectional(LSTM(units=128, return_sequences=True, activation='tanh'))(lstm)
     lstm = BatchNormalization()(lstm)
     lstm = Dropout(0.4)(lstm)
-
-    # Change activation of the last LSTM layer from 'relu' to 'tanh' for potentially better stability
-    lstm = LSTM(units=64, return_sequences=False, activation='tanh')(lstm) # Keep tanh activation
+    lstm = LSTM(units=64, return_sequences=False, activation='relu')(lstm)
     lstm = BatchNormalization()(lstm)
     lstm = Dropout(0.3)(lstm)
-
-    # Combine LSTM output and device embedding
-    lstm_flattened = Dense(32)(lstm) # Optional dense layer after LSTM
+    
+    lstm_flattened = Dense(32)(lstm)
     merged = tf.keras.layers.concatenate([lstm_flattened, device_embedding])
-
     dense = Dense(32, activation='relu')(merged)
     dense = BatchNormalization()(dense)
     dense = Dropout(0.2)(dense)
-
-    output = Dense(1)(dense) # Final linear layer for regression
-
+    output = Dense(1)(dense)
+    
     model = Model(inputs=[power_input, device_input], outputs=output)
     optimizer = Adam(learning_rate=0.001)
     model.compile(optimizer=optimizer, loss='mean_squared_error')
     return model
 
-# Load and preprocess data from CSV
-df = None
-# Look for CSV in the same directory as the script
-csv_path = os.path.join(os.path.dirname(__file__), 'energy_readings.csv') 
-
-try:
-    print(f"Loading data from {csv_path}...")
-    df = pd.read_csv(csv_path) # Load from CSV
-    print(f"Data loaded ({len(df)} rows). Processing...")
-
-    if df.empty:
-        print(f"No data found in '{csv_path}'. Exiting.", file=sys.stderr)
-        sys.exit(1) # Use sys.exit
-
-except FileNotFoundError:
-    print(f"Error: CSV file not found at {csv_path}", file=sys.stderr)
-    sys.exit(1)
-except Exception as e:
-    print(f"\nAn unexpected error occurred during CSV loading: {e}", file=sys.stderr)
-    sys.exit(1)
-
-# Rename columns for consistency if needed later
-# Ensure column names match the CSV ('timestamp', 'power', 'device_id')
-df.rename(columns={"timestamp": "DateTime", "power": "Power"}, inplace=True)
-
-# Preprocessing steps, scaling, and dataset splitting
-df["DateTime"] = pd.to_datetime(df["DateTime"]) # Ensure DateTime type
-# df = df.set_index("DateTime") # Set DateTime as index ONLY if resampling
-
-device_ids = df['device_id'].unique()
-# combined_data = pd.DataFrame() # Not needed if not resampling
-
-# print("Resampling data to hourly means...")
-# # --- Start: Comment out or remove resampling section ---
-# # for device_id in device_ids:
-# #     # Select data for the device and resample the 'Power' column
-# #     # Use 'h' instead of deprecated 'H' if pandas version >= 2.2
-# #     try:
-# #         device_data = df[df['device_id'] == device_id][['Power']].resample("h").mean()
-# #     except ValueError: # Handle older pandas versions that might not recognize 'h'
-# #         print("Using deprecated 'H' for resampling due to pandas version or error with 'h'.", file=sys.stderr)
-# #         device_data = df[df['device_id'] == device_id][['Power']].resample("H").mean()
-# #     # Drop hours where the mean is NaN (i.e., no data in that hour)
-# #     device_data.dropna(inplace=True)
-# #     if not device_data.empty:
-# #         device_data['device_id'] = device_id # Add device_id back
-# #         combined_data = pd.concat([combined_data, device_data])
-# #
-# # if combined_data.empty:
-# #     print("No data remaining after resampling. Check input data and resampling frequency.", file=sys.stderr)
-# #     sys.exit(1)
-# #
-# # print(f"Resampling complete. Combined data has {len(combined_data)} rows.")
-# # # Reset index so DateTime becomes a column again, useful for splitting/grouping if needed
-# # combined_data.reset_index(inplace=True)
-# # --- End: Comment out or remove resampling section ---
-
-# Use the original DataFrame 'df' instead of 'combined_data'
-combined_data = df # Assign df to combined_data to minimize changes below
-combined_data['DateTime'] = pd.to_datetime(combined_data['DateTime']) # Ensure DateTime is correct type
-
-# Scale power values
-print("Scaling power values...")
-power_scaler = MinMaxScaler(feature_range=(0, 1))
-# Ensure 'Power' column exists and fit scaler
-if 'Power' not in combined_data.columns or combined_data['Power'].isnull().all():
-     # Adjusted error message as resampling is removed
-     print("Error: 'Power' column is missing or all null in the loaded CSV data.", file=sys.stderr)
-     sys.exit(1)
-# Fit and transform the 'Power' column. Use [['Power']] to keep it as a DataFrame.
-combined_data['Power_scaled'] = power_scaler.fit_transform(combined_data[['Power']])
-scaler_filename = 'power_scaler.joblib'
-joblib.dump(power_scaler, scaler_filename)
-print(f"Power scaler saved to {scaler_filename}")
-
-# Split data into train, validation, and test (e.g., 70/15/15 split)
-# Ensure data is sorted by time before splitting
-combined_data = combined_data.sort_values(by=['device_id', 'DateTime'])
-
-def split_data(data, train_pct=0.7, val_pct=0.15):
-    # Using global time split. Ensure data is sorted by DateTime first.
-    data = data.sort_values('DateTime') # Sort globally by time before splitting
-    n = len(data)
-    train_end = int(n * train_pct)
-    val_end = train_end + int(n * val_pct)
-    train = data.iloc[:train_end]
-    val = data.iloc[train_end:val_end]
-    test = data.iloc[val_end:]
-    print(f"Data split (globally by time): Train={len(train)}, Validation={len(val)}, Test={len(test)}")
-    # Check if splits are empty
-    if train.empty or val.empty:
-         print("Warning: Training or Validation set is empty after split.", file=sys.stderr)
+def split_data(data, train_pct=0.8, val_pct=0.2):
+    """Split data into train, validation, and test sets."""
+    training_size = int(len(data) * train_pct)
+    val_size = int(training_size * val_pct)
+    train = data.iloc[:training_size-val_size]
+    val = data.iloc[training_size-val_size:training_size]
+    test = data.iloc[training_size:]
     return train, val, test
 
+def create_dataset(dataset, time_step=1):
+    """Create time series dataset with features and targets."""
+    dataX, dataY = [], []
+    power_values = dataset['Power_scaled'].values
+    device_values = dataset['device_id'].values
+    
+    if len(power_values) <= time_step + 1:
+        return np.array(dataX, dtype=object), np.array(dataY)
+        
+    for i in range(len(power_values) - time_step - 1):
+        power_window = power_values[i:(i + time_step)]
+        device_id_value = device_values[i + time_step - 1]
+        features = [power_window, device_id_value]
+        dataX.append(features)
+        dataY.append(power_values[i + time_step])
+    
+    return np.array(dataX, dtype=object), np.array(dataY)
+
+# Load and preprocess data
+df = pd.read_csv('energy_readings.csv')
+df.rename(columns={"timestamp": "DateTime", "power": "Power"}, inplace=True)
+
+print(f"Dataset contains {len(df)} rows")
+if len(df) > 50000:
+    df = df.iloc[:50000]
+
+# Filter to device_id = 1
+unique_devices = df['device_id'].unique()
+if len(unique_devices) != 1 or unique_devices[0] != 1:
+    df = df[df['device_id'] == 1]
+
+df["DateTime"] = pd.to_datetime(df["DateTime"])
+df = df.set_index("DateTime")
+
+device_id = 1
+device_ids = np.array([device_id])
+
+# Resample data to ensure sufficient data points
+try:
+    device_data = df.resample("h").mean()
+    if len(device_data) < 200:
+        device_data = df.resample("15T").mean()
+    if len(device_data) < 200:
+        device_data = df.resample("5T").mean()
+    if len(device_data) < 200:
+        device_data = df.copy()
+except Exception:
+    device_data = df.copy()
+
+device_data['device_id'] = device_id
+combined_data = device_data
+
+if len(combined_data) < 150:
+    raise ValueError(f"Dataset too small: {len(combined_data)} rows")
+
+# Scale power values
+power_scaler = MinMaxScaler(feature_range=(0, 1))
+combined_data['Power_scaled'] = power_scaler.fit_transform(combined_data['Power'].values.reshape(-1, 1))
+joblib.dump(power_scaler, 'power_scaler.joblib')
+
+# Split data
 train_data, val_data, test_data = split_data(combined_data)
 
-# Create time-series datasets suitable for LSTM
-def create_dataset(dataset, time_step=1):
-    dataX, dataY = [], []
-    # Group by device to create sequences per device without mixing them
-    # Ensure DateTime is sorted within each group before creating sequences
-    grouped = dataset.sort_values('DateTime').groupby('device_id')
-    for device_id, device_df in grouped:
-        power_values = device_df['Power_scaled'].values
-        # device_id is constant for this group
-        if len(power_values) > time_step: # Need at least time_step + 1 points
-            for i in range(len(power_values) - time_step): # Iterate up to the point where a full sequence + target is available
-                power_window = power_values[i:(i + time_step)]
-                # Append [power_window, device_id] as features
-                dataX.append([power_window, device_id])
-                # Append the next power value as the target
-                dataY.append(power_values[i + time_step])
-    if not dataX:
-        print("Warning: create_dataset resulted in empty dataX. Check input dataset size and time_step.", file=sys.stderr)
-        return np.array([]), np.array([])
-    # Convert lists to numpy arrays, handling the object type for the mixed list
-    return np.array(dataX, dtype=object), np.array(dataY).astype('float32') # Ensure Y is float
-
+# Create time series datasets
 time_step = 100
-print(f"Creating datasets with time_step={time_step}...")
+if len(combined_data) < 500:
+    time_step = min(50, len(combined_data) // 4)
+    
 X_train, y_train = create_dataset(train_data, time_step)
 X_val, y_val = create_dataset(val_data, time_step)
-X_test, y_test = create_dataset(test_data, time_step) # Create test set for evaluation
 
-# Check if datasets are empty after creation
-if X_train.size == 0 or X_val.size == 0:
-    print("Error: Training or validation dataset is empty after sequence creation. Check data splitting and time_step.", file=sys.stderr)
-    sys.exit(1)
+if len(X_train) == 0:
+    raise ValueError("No training data created")
 
-print("Separating features for model input...")
-# Separate power sequences and device IDs, ensuring correct types and shapes
-X_train_power = np.array([x[0] for x in X_train]).astype('float32').reshape(-1, time_step, 1)
-X_train_device = np.array([x[1] for x in X_train]).astype('float32').reshape(-1, 1) # Ensure device ID is float for the model layer
-X_val_power = np.array([x[0] for x in X_val]).astype('float32').reshape(-1, time_step, 1)
-X_val_device = np.array([x[1] for x in X_val]).astype('float32').reshape(-1, 1)
-if X_test.size > 0:
-    X_test_power = np.array([x[0] for x in X_test]).astype('float32').reshape(-1, time_step, 1)
-    X_test_device = np.array([x[1] for x in X_test]).astype('float32').reshape(-1, 1)
+# Prepare training data
+X_train_power = np.stack([x[0] for x in X_train]).reshape(-1, time_step, 1)
+X_train_device = np.array([x[1] for x in X_train]).reshape(-1, 1)
+
+# Prepare validation data
+if len(X_val) > 0:
+    X_val_power = np.stack([x[0] for x in X_val]).reshape(-1, time_step, 1)
+    X_val_device = np.array([x[1] for x in X_val]).reshape(-1, 1)
+    validation_data = ([X_val_power, X_val_device], y_val)
 else:
-    X_test_power, X_test_device, y_test = None, None, None # Handle empty test set
+    validation_data = None
+    validation_split = 0.2
 
-# Train the model
-num_devices = len(device_ids) # Total number of unique devices in original data
-print(f"Number of unique device IDs in original data: {num_devices}")
-print("Creating unified LSTM model...")
+# Train model
+num_devices = len(device_ids)
 model = create_unified_lstm_model(time_step, num_devices)
-model.summary() # Print model summary
 
-# Define callbacks
 callbacks = [
-    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True, verbose=1),
-    ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=0.0001, verbose=1),
-    ModelCheckpoint(filepath='unified_best_model.h5', monitor='val_loss', save_best_only=True, verbose=1)
+    EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
+    ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=0.0001),
+    ModelCheckpoint(filepath='unified_best_model.h5', monitor='val_loss', save_best_only=True)
 ]
 
-print("Starting model training...")
-history = model.fit(
-    [X_train_power, X_train_device], y_train,
-    validation_data=([X_val_power, X_val_device], y_val),
-    epochs=100, batch_size=32, callbacks=callbacks, verbose=1
-)
-
-# Save the final model (potentially the best one restored by EarlyStopping)
-final_model_path = 'unified_lstm_model.h5'
-model.save(final_model_path)
-print(f"Training complete. Final model saved to {final_model_path}")
-
-# Optional: Evaluate on test set if it exists
-if X_test_power is not None and y_test is not None:
-    print("Evaluating on test set...")
-    test_loss = model.evaluate([X_test_power, X_test_device], y_test, verbose=0)
-    print(f"Test Loss: {test_loss}")
+if validation_data is not None:
+    history = model.fit(
+        [X_train_power, X_train_device], y_train,
+        validation_data=validation_data,
+        epochs=100, batch_size=32, callbacks=callbacks
+    )
 else:
-    print("Test set was empty or not created, skipping evaluation.")
+    history = model.fit(
+        [X_train_power, X_train_device], y_train,
+        validation_split=validation_split,
+        epochs=100, batch_size=32, callbacks=callbacks
+    )
 
-print("Script finished.")
+model.save('unified_lstm_model.h5')
+
+# Evaluate model
+X_test, y_test = create_dataset(test_data, time_step)
+X_test_power = np.stack([x[0] for x in X_test]).reshape(-1, time_step, 1)
+X_test_device = np.array([x[1] for x in X_test]).reshape(-1, 1)
+
+test_loss = model.evaluate([X_test_power, X_test_device], y_test, verbose=0)
+y_pred = model.predict([X_test_power, X_test_device])
+
+# Calculate metrics
+mse = np.mean((y_test - y_pred.flatten())**2)
+mae = np.mean(np.abs(y_test - y_pred.flatten()))
+rmse = np.sqrt(mse)
+
+# Convert to actual power values
+y_test_inv = power_scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
+y_pred_inv = power_scaler.inverse_transform(y_pred).flatten()
+
+mse_inv = np.mean((y_test_inv - y_pred_inv)**2)
+mae_inv = np.mean(np.abs(y_test_inv - y_pred_inv))
+rmse_inv = np.sqrt(mse_inv)
+
+print(f"Test Loss (MSE): {test_loss:.6f}")
+print(f"Normalized Metrics - MSE: {mse:.6f}, MAE: {mae:.6f}, RMSE: {rmse:.6f}")
+print(f"Actual Power Metrics - MSE: {mse_inv:.6f}, MAE: {mae_inv:.6f}, RMSE: {rmse_inv:.6f}")
+
+# Plot predictions vs actual
+plt.figure(figsize=(12, 6))
+max_samples = min(100, len(y_test_inv))
+plt.plot(y_test_inv[:max_samples], label='Actual')
+plt.plot(y_pred_inv[:max_samples], label='Predicted')
+plt.title(f'Device {device_id} - Predictions vs Actual')
+plt.xlabel('Sample Index')
+plt.ylabel('Power')
+plt.legend()
+plt.grid(True)
+plt.savefig(f'D:\\HPE\\LSTM\\device_{device_id}_test_accuracy.png')
+plt.close()
+
+# Performance summary
+avg_power = np.mean(np.abs(y_test_inv))
+mae_percentage = mae_inv / avg_power * 100
+accuracy_percentage = 100 - mae_percentage
+
+print(f"Performance Summary:")
+print(f"Average power: {avg_power:.2f}")
+print(f"Mean absolute error: {mae_inv:.2f}")
+print(f"Error percentage: {mae_percentage:.2f}%")
+print(f"Accuracy: {accuracy_percentage:.2f}%")
