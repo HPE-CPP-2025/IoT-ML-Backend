@@ -225,30 +225,6 @@ async def sse_subscribe():
         "last_arduino_state": last_arduino_state
     }
 
-@app.post("/toggle-device/{device_id}")
-async def toggle_device(device_id: str):
-    """Toggle device in production and update local control."""
-    try:
-        logger.info(f"Toggling device {device_id}")
-        response = await make_authenticated_request(
-            TOGGLE_ENDPOINT.format(deviceId=device_id), method="POST"
-        )
-        result = response.json()
-        
-        # Update Arduino control if applicable
-        if device_id == ARDUINO_DEVICE_ID:
-            global last_arduino_state
-            is_on = result.get("on", False)
-            new_state_str = "on" if is_on else "off"
-            if new_state_str != last_arduino_state:
-                write_control_file(new_state_str.upper())
-                last_arduino_state = new_state_str
-        
-        return result
-    except Exception as e:
-        logger.error(f"Toggle failed for device {device_id}: {e}")
-        raise HTTPException(status_code=502, detail=f"Toggle request failed: {e}")
-
 @app.get("/active-jobs")
 async def get_active_jobs():
     """List active simulation jobs."""
@@ -274,41 +250,6 @@ async def get_active_jobs():
         del active_cron_jobs[device_id]
 
     return result
-
-@app.post("/force-start-job/{device_id}")
-async def force_start_job(device_id: str):
-    """Manually start a simulation job."""
-    if device_id == ARDUINO_DEVICE_ID:
-        return {"status": "error", "message": "Cannot start job for Arduino device"}
-    
-    if device_id in active_cron_jobs and active_cron_jobs[device_id]["thread"].is_alive():
-        return {"status": "error", "message": f"Job for device {device_id} already running"}
-    
-    stop_event = threading.Event()
-    thread = run_cron_job(device_id, stop_event)
-    if thread:
-        active_cron_jobs[device_id] = {
-            "thread": thread,
-            "stop_event": stop_event,
-            "started_at": datetime.now().isoformat(),
-            "device_name": f"Device {device_id}"
-        }
-        return {"status": "success", "message": f"Started job for device {device_id}"}
-    else:
-        return {"status": "error", "message": f"Failed to start job for device {device_id}"}
-
-@app.post("/force-stop-job/{device_id}")
-async def force_stop_job(device_id: str):
-    """Manually stop a simulation job."""
-    if device_id == ARDUINO_DEVICE_ID:
-        return {"status": "error", "message": "Cannot stop job for Arduino device"}
-    
-    job_info = active_cron_jobs.get(device_id)
-    if not job_info or not job_info["thread"].is_alive():
-        return {"status": "error", "message": f"No active job found for device {device_id}"}
-    
-    job_info["stop_event"].set()
-    return {"status": "success", "message": f"Stop signal sent to job for device {device_id}"}
 
 @app.get("/health")
 async def health_check():
